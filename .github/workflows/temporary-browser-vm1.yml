@@ -305,7 +305,7 @@ jobs:
             DISPLAY=:99 xfce4-terminal --disable-server --command "bash --rcfile /etc/immersive-vm-shell.rc -i" > "$RUNNER_TEMP/vmtest/xfce-terminal.log" 2>&1 &
             XTERM_PID=$!
             x11vnc -storepasswd "${VM_WEB_PASSWORD:0:8}" "$RUNNER_TEMP/vmtest/x11vnc.pass" >/dev/null
-            x11vnc -display :99 -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" -forever -shared -rfbport 5900 -localhost -noxdamage > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:99 XDG_SESSION_TYPE=x11 x11vnc -display :99 -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" -forever -shared -rfbport 5900 -localhost -noxdamage > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
             VNC_PID=$!
             VNC_READY=0
             for vnc_attempt in $(seq 1 20); do
