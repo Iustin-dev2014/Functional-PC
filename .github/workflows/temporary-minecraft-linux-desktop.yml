@@ -1,0 +1,213 @@
+name: Temporary Minecraft Linux Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-minecraft-linux-desktop
+  cancel-in-progress: true
+
+jobs:
+  minecraft-desktop:
+    name: Ubuntu desktop with Minecraft Launcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out desktop proxy
+        uses: actions/checkout@v4
+
+      - name: Validate required password secret
+        shell: bash
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VM_WEB_PASSWORD}" ]]; then
+            echo "::error::Missing repository secret VM_WEB_PASSWORD. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [[ "${#VM_WEB_PASSWORD}" -lt 16 ]]; then
+            echo "::error::VM_WEB_PASSWORD must be at least 16 characters long."
+            exit 1
+          fi
+
+      - name: Install XFCE desktop, noVNC, software rendering, and Minecraft Launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 dbus-x11 xvfb x11vnc novnc websockify \
+            mesa-utils libgl1-mesa-dri libglx-mesa0 x11-utils \
+            curl ca-certificates fonts-dejavu fonts-liberation
+
+          curl --fail --silent --show-error --location \
+            "https://launcher.mojang.com/download/Minecraft.deb" \
+            --output "$RUNNER_TEMP/Minecraft.deb"
+          sudo apt-get install -y "$RUNNER_TEMP/Minecraft.deb"
+
+          npm install --prefix "$RUNNER_TEMP/minecraft-desktop-proxy" --no-save http-proxy@1.18.1
+          echo "Minecraft Launcher package installed:"
+          dpkg-query -W -f='${Status} ${Version}\n' minecraft-launcher
+          command -v minecraft-launcher
+          command -v Xvfb
+          command -v x11vnc
+          command -v websockify
+          test -f /usr/share/novnc/vnc.html
+
+      - name: Start the virtual Linux desktop and browser gateway
+        shell: bash
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export NODE_PATH="$RUNNER_TEMP/minecraft-desktop-proxy/node_modules"
+          export DISPLAY=:0
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          mkdir -p "$RUNNER_TEMP/minecraft-desktop"
+          LOG_DIR="$RUNNER_TEMP/minecraft-desktop"
+          echo "Desktop logs are stored in the temporary runner workspace."
+
+          # GitHub-hosted runners do not provide a dedicated gaming GPU.
+          # Xvfb + Mesa software rendering makes this a best-effort test desktop.
+          Xvfb :0 -screen 0 1600x900x24 +extension GLX +render -noreset \
+            > "$LOG_DIR/xvfb.log" 2>&1 &
+          XVFB_PID=$!
+
+          for attempt in $(seq 1 20); do
+            if xdpyinfo -display :0 >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! xdpyinfo -display :0 >/dev/null 2>&1; then
+            echo "::error::Virtual X display failed to start."
+            cat "$LOG_DIR/xvfb.log" || true
+            exit 1
+          fi
+
+          dbus-run-session -- startxfce4 > "$LOG_DIR/xfce.log" 2>&1 &
+          XFCE_PID=$!
+
+          # Wait for XFCE to initialize before exposing the desktop.
+          for attempt in $(seq 1 45); do
+            if pgrep -x 'xfce4-session' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          x11vnc -display :0 -forever -shared -nopw -localhost -rfbport 5900 \
+            > "$LOG_DIR/x11vnc.log" 2>&1 &
+          VNC_PID=$!
+
+          websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 \
+            > "$LOG_DIR/websockify.log" 2>&1 &
+          WEBSOCKIFY_PID=$!
+
+          VM_UI_PORT=8090 node "$GITHUB_WORKSPACE/.github/scripts/minecraft-desktop-proxy.cjs" \
+            > "$LOG_DIR/proxy.log" 2>&1 &
+          PROXY_PID=$!
+
+          cleanup() {
+            for pid in "${TUNNEL_PID:-}" "${PROXY_PID:-}" "${WEBSOCKIFY_PID:-}" "${VNC_PID:-}" "${XFCE_PID:-}" "${XVFB_PID:-}"; do
+              if [[ -n "$pid" ]]; then
+                kill "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+          TUNNEL_PID=""
+          trap cleanup EXIT
+
+          # Smoke-test that the password gate protects the desktop and that noVNC is served.
+          READY=0
+          for attempt in $(seq 1 30); do
+            if curl --silent --output /dev/null --write-out '%{http_code}' \
+              http://127.0.0.1:8090/vnc.html | grep -q '^401$'; then
+              if curl --fail --silent --show-error --user "cctvtest:${VM_WEB_PASSWORD}" \
+                http://127.0.0.1:8090/vnc.html -o "$LOG_DIR/vnc.html" 2>/dev/null \
+                && grep -qi 'noVNC' "$LOG_DIR/vnc.html"; then
+                READY=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+          if [[ "$READY" -ne 1 ]]; then
+            echo "::error::Browser desktop failed its local authentication/noVNC smoke test."
+            cat "$LOG_DIR/proxy.log" || true
+            cat "$LOG_DIR/websockify.log" || true
+            cat "$LOG_DIR/x11vnc.log" || true
+            exit 1
+          fi
+
+          # Open the official launcher in the desktop so the user can sign in interactively.
+          (DISPLAY=:0 LIBGL_ALWAYS_SOFTWARE=1 dbus-run-session -- minecraft-launcher) \
+            > "$LOG_DIR/minecraft-launcher.log" 2>&1 &
+          LAUNCHER_PID=$!
+
+          CLOUDFLARED="$RUNNER_TEMP/minecraft-desktop/cloudflared"
+          curl --fail --silent --show-error --location \
+            "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-amd64" \
+            --output "$CLOUDFLARED"
+          chmod 700 "$CLOUDFLARED"
+          "$CLOUDFLARED" --version
+
+          URL=""
+          for attempt in $(seq 1 5); do
+            echo "Starting temporary secure-tunnel transport (attempt $attempt/5)..."
+            : > "$LOG_DIR/cloudflared.log"
+            "$CLOUDFLARED" tunnel --url "http://127.0.0.1:8090" --no-autoupdate \
+              > "$LOG_DIR/cloudflared.log" 2>&1 &
+            TUNNEL_PID=$!
+
+            for wait_attempt in $(seq 1 25); do
+              URL="$(grep -Eo 'https://[^[:space:]]+trycloudflare\.com' "$LOG_DIR/cloudflared.log" | head -n 1 || true)"
+              if [[ -n "$URL" ]]; then
+                break
+              fi
+              if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            if [[ -n "$URL" ]]; then
+              break
+            fi
+            kill "$TUNNEL_PID" 2>/dev/null || true
+            wait "$TUNNEL_PID" 2>/dev/null || true
+            TUNNEL_PID=""
+            if [[ "$attempt" -lt 5 ]]; then sleep $((attempt * 4)); fi
+          done
+
+          if [[ -z "$URL" ]]; then
+            echo "::error::Could not create the temporary desktop tunnel."
+            cat "$LOG_DIR/cloudflared.log"
+            exit 1
+          fi
+
+          echo "=================================================="
+          echo "IMMERSIVE-CCTV TEMPORARY MINECRAFT DESKTOP READY"
+          echo "Open: ${URL}/vnc.html?autoconnect=true&resize=remote&path=websockify"
+          echo "HTTP username: cctvtest"
+          echo "HTTP password: the repository secret VM_WEB_PASSWORD"
+          echo "Minecraft Launcher is opening; sign in inside the launcher with your own Microsoft account."
+          echo "This runner has software rendering only; Minecraft performance may be poor."
+          echo "The desktop is temporary and will close after 45 minutes."
+          echo "Do not share the URL or password."
+          echo "=================================================="
+
+          for remaining in $(seq 1 2700); do
+            if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+              echo "::error::The virtual desktop stopped unexpectedly."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "45-minute session limit reached; closing the temporary desktop."
