@@ -1,0 +1,223 @@
+name: Temporary Browser Windows VM (terminal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_mode:
+        description: "Choose the Windows browser session"
+        type: choice
+        required: true
+        default: terminal
+        options:
+          - terminal
+      snapshot_source:
+        description: "Restore a saved Windows workspace: latest, none, or specific"
+        type: choice
+        required: true
+        default: latest
+        options:
+          - latest
+          - none
+          - specific
+      snapshot_run_id:
+        description: "Run ID from the available Windows snapshot list (only for specific)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: temporary-browser-windows-vm
+  cancel-in-progress: true
+
+jobs:
+  browser-windows:
+    name: Start temporary Windows browser terminal
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify hosted Windows environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows') { throw "This workflow must run on a Windows runner." }
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "Runner image: $env:ImageOS"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+
+      - name: Check required password secret
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VM_WEB_PASSWORD)) {
+            throw "Missing repository secret VM_WEB_PASSWORD. Add it in Settings > Secrets and variables > Actions."
+          }
+          if ($env:VM_WEB_PASSWORD.Length -lt 12) {
+            throw "For the public Windows terminal, VM_WEB_PASSWORD must contain at least 12 characters."
+          }
+
+      - name: List and select Windows workspace snapshot
+        id: snapshot
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          SNAPSHOT_SOURCE: ${{ inputs.snapshot_source }}
+          SNAPSHOT_RUN_ID: ${{ inputs.snapshot_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = $env:SNAPSHOT_SOURCE
+          if ($source -eq 'none') {
+            "source=none" >> $env:GITHUB_OUTPUT
+            Write-Host "Clean Windows workspace selected."
+            exit 0
+          }
+          $runs = gh run list --workflow temporary-browser-windows-vm.yml --limit 100 --json databaseId,status,conclusion,createdAt | ConvertFrom-Json
+          $available = @()
+          foreach ($run in $runs) {
+            if ([string]$run.databaseId -eq $env:CURRENT_RUN_ID -or $run.status -ne 'completed') { continue }
+            $name = "windows-session-save-$($run.databaseId)"
+            $arts = gh api "repos/$env:GH_REPO/actions/runs/$($run.databaseId)/artifacts?per_page=100" | ConvertFrom-Json
+            if ($arts.artifacts | Where-Object { $_.name -eq $name -and -not $_.expired }) {
+              $available += [string]$run.databaseId
+              Write-Host "Available snapshot: run_id=$($run.databaseId), artifact=$name"
+            }
+          }
+          if (-not $available.Count) {
+            if ($source -eq 'specific') { throw "No saved Windows snapshots are available." }
+            "source=none" >> $env:GITHUB_OUTPUT
+            Write-Host "No prior snapshot found; starting clean."
+            exit 0
+          }
+          if ($source -eq 'latest') { $selected = $available[0] }
+          elseif ($source -eq 'specific') {
+            if ($env:SNAPSHOT_RUN_ID -notmatch '^\d+$' -or $available -notcontains $env:SNAPSHOT_RUN_ID) {
+              throw "Enter a run ID that has an available Windows snapshot (see log above)."
+            }
+            $selected = $env:SNAPSHOT_RUN_ID
+          } else { throw "Unknown snapshot source: $source" }
+          $artifact = "windows-session-save-$selected"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\windows-snapshot" | Out-Null
+          gh run download $selected --name $artifact --dir "$env:RUNNER_TEMP\windows-snapshot"
+          "source=artifact" >> $env:GITHUB_OUTPUT
+          "snapshot_run_id=$selected" >> $env:GITHUB_OUTPUT
+          Write-Host "Downloaded snapshot from run $selected."
+
+      - name: Restore Windows workspace snapshot
+        if: steps.snapshot.outputs.source == 'artifact'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Get-ChildItem "$env:RUNNER_TEMP\windows-snapshot" -Filter '*.zip' -Recurse | Select-Object -First 1
+          if (-not $archive) { throw "Snapshot ZIP is missing or invalid." }
+          $dest = "$env:RUNNER_TEMP\windows-workspace"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $dest -Force
+          Write-Host "Restored workspace files into $dest"
+
+      - name: Install browser terminal and Cloudflare tunnel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --version
+          npm --version
+          $tools = "$env:RUNNER_TEMP\windows-vm"
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          npm install --prefix "$tools\node" --no-audit --no-fund wetty
+          $cloudflared = "$tools\cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
+          & $cloudflared --version
+          "WINDOWS_VM_TOOLS=$tools" >> $env:GITHUB_ENV
+
+      - name: Start protected browser PowerShell session
+        id: session
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = $env:WINDOWS_VM_TOOLS
+          $port = 3000
+          $env:WETTY_PORT = "$port"
+          $env:WETTY_HOST = "127.0.0.1"
+          $env:WETTY_BASE = "/"
+          $env:WETTY_TITLE = "IMMERSIVE CCTV - Temporary Windows PowerShell"
+          $env:WETTY_SSH = "false"
+          $env:WETTY_COMMAND = "powershell.exe"
+          $env:WETTY_CREDENTIALS = "cctvtest:$env:VM_WEB_PASSWORD"
+          $wetty = Get-ChildItem "$tools\node\node_modules\.bin\wetty*" | Select-Object -First 1
+          if (-not $wetty) { throw "Wetty executable was not installed." }
+          $server = Start-Process -FilePath "node.exe" -ArgumentList @("$tools\node\node_modules\wetty\dist\index.js","--host","127.0.0.1","--port","$port","--command","powershell.exe") -PassThru -WindowStyle Hidden -RedirectStandardOutput "$tools\wetty-out.log" -RedirectStandardError "$tools\wetty-err.log"
+          Start-Sleep -Seconds 5
+          if ($server.HasExited) {
+            Get-Content "$tools\wetty-out.log" -ErrorAction SilentlyContinue
+            Get-Content "$tools\wetty-err.log" -ErrorAction SilentlyContinue
+            throw "Browser terminal failed to start. See Wetty logs above."
+          }
+          $cloudflared = "$tools\cloudflared.exe"
+          $tunnel = Start-Process -FilePath $cloudflared -ArgumentList @("tunnel","--url","http://127.0.0.1:$port","--no-autoupdate") -PassThru -WindowStyle Hidden -RedirectStandardOutput "$tools\cloudflared.log" -RedirectStandardError "$tools\cloudflared.log"
+          $url = $null
+          for ($i=0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path "$tools\cloudflared.log") {
+              $match = Select-String -Path "$tools\cloudflared.log" -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | Select-Object -First 1
+              if ($match) { $url = $match.Matches[0].Value; break }
+            }
+            if ($tunnel.HasExited) { break }
+          }
+          if (-not $url) {
+            Get-Content "$tools\cloudflared.log" -ErrorAction SilentlyContinue
+            throw "Could not create a Cloudflare Quick Tunnel."
+          }
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "TEMPORARY WINDOWS POWERSHELL TERMINAL"
+          Write-Host "URL: $url"
+          Write-Host "Username: cctvtest"
+          Write-Host "Password: the VM_WEB_PASSWORD secret"
+          Write-Host "This is an ephemeral GitHub-hosted Windows runner, not a persistent VM."
+          Write-Host "=================================================="
+          $shutdown = Join-Path $tools "shutdown.request"
+          $nosave = Join-Path $tools "nosave.request"
+          $deadline = [DateTime]::UtcNow.AddMinutes(2)
+          while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-Path $shutdown) { break }
+            Start-Sleep -Seconds 1
+          }
+          while (-not (Test-Path $shutdown) -and -not $server.HasExited -and -not $tunnel.HasExited) {
+            Start-Sleep -Seconds 1
+          }
+          if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
+          if (-not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
+          if (Test-Path $nosave) { "no_save=true" >> $env:GITHUB_OUTPUT }
+          Write-Host "Windows browser session is closing."
+
+      - name: Save Windows workspace snapshot
+        if: always() && steps.session.outcome == 'success' && steps.session.outputs.no_save != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workspace = "$env:RUNNER_TEMP\windows-workspace"
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          $zip = "$env:RUNNER_TEMP\windows-session-save.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$workspace\*" -DestinationPath $zip -Force
+          New-Item -ItemType Directory -Force -Path windows-session-save | Out-Null
+          Copy-Item $zip windows-session-save\windows-session-save.zip -Force
+
+      - name: Upload Windows workspace snapshot
+        if: always() && steps.session.outcome == 'success' && steps.session.outputs.no_save != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-session-save-${{ github.run_id }}
+          path: windows-session-save/windows-session-save.zip
+          if-no-files-found: error
+          retention-days: 30
