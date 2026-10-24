@@ -73,6 +73,16 @@ jobs:
             exit 1
           fi
 
+      - name: Install GitHub CLI for snapshot discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          gh --version
+
       - name: List and select Ubuntu snapshot artifact
         id: find_snapshot
         shell: bash
@@ -94,7 +104,7 @@ jobs:
           fi
 
           # Enumerate completed workflow runs and print every still-available Ubuntu snapshot artifact.
-          mapfile -t RUN_IDS < <(gh run list --workflow temporary-browser-vm.yml --limit 1000 \
+          mapfile -t RUN_IDS < <(gh run list --workflow temporary-browser-vm1.yml --limit 1000 \
             --json databaseId,status,conclusion,createdAt \
             --jq ".[] | select((.databaseId | tostring) != \"${CURRENT_RUN_ID}\" and .status == \"completed\") | .databaseId")
           declare -a AVAILABLE_RUN_IDS=()
@@ -279,14 +289,44 @@ jobs:
             Xvfb :99 -screen 0 1280x800x24 -ac > "$RUNNER_TEMP/vmtest/xvfb.log" 2>&1 &
             DISPLAY_PID=$!
             sleep 2
+            if ! kill -0 "$DISPLAY_PID" 2>/dev/null; then
+              echo "::error::Xvfb failed to start. Diagnostic log:"
+              cat "$RUNNER_TEMP/vmtest/xvfb.log" || true
+              exit 1
+            fi
             dbus-run-session -- startxfce4 > "$RUNNER_TEMP/vmtest/xfce.log" 2>&1 &
             XFCE_PID=$!
             sleep 5
+            if ! kill -0 "$XFCE_PID" 2>/dev/null; then
+              echo "::error::XFCE exited during startup. Diagnostic log:"
+              cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+              exit 1
+            fi
             DISPLAY=:99 xfce4-terminal --disable-server --command "bash --rcfile /etc/immersive-vm-shell.rc -i" > "$RUNNER_TEMP/vmtest/xfce-terminal.log" 2>&1 &
             XTERM_PID=$!
             x11vnc -storepasswd "${VM_WEB_PASSWORD:0:8}" "$RUNNER_TEMP/vmtest/x11vnc.pass" >/dev/null
-            x11vnc -display :99 -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" -forever -shared -rfbport 5900 -localhost > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
+            x11vnc -display :99 -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" -forever -shared -rfbport 5900 -localhost -noxdamage > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
             VNC_PID=$!
+            VNC_READY=0
+            for vnc_attempt in $(seq 1 20); do
+              if ! kill -0 "$VNC_PID" 2>/dev/null; then
+                echo "::error::x11vnc exited before opening port 5900. Diagnostic log:"
+                cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
+                echo "XFCE diagnostic log:"
+                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+                exit 1
+              fi
+              if (echo > /dev/tcp/127.0.0.1/5900) >/dev/null 2>&1; then
+                VNC_READY=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$VNC_READY" -ne 1 ]]; then
+              echo "::error::x11vnc remained running but port 5900 never became ready. Diagnostic log:"
+              cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
+              exit 1
+            fi
             NOVNC_WEB="$RUNNER_TEMP/vmtest/novnc-web"
             mkdir -p "$NOVNC_WEB"
             cp -a /usr/share/novnc/. "$NOVNC_WEB/"
@@ -297,6 +337,24 @@ jobs:
           NOVNC_INDEX
             websockify --web="$NOVNC_WEB" 6080 localhost:5900 > "$RUNNER_TEMP/vmtest/websockify.log" 2>&1 &
             WEB_PID=$!
+            WEB_READY=0
+            for web_attempt in $(seq 1 15); do
+              if ! kill -0 "$WEB_PID" 2>/dev/null; then
+                echo "::error::noVNC/websockify exited during startup. Diagnostic log:"
+                cat "$RUNNER_TEMP/vmtest/websockify.log" || true
+                exit 1
+              fi
+              if curl --fail --silent http://127.0.0.1:6080/ -o /dev/null; then
+                WEB_READY=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$WEB_READY" -ne 1 ]]; then
+              echo "::error::noVNC web interface did not become ready on port 6080. Diagnostic log:"
+              cat "$RUNNER_TEMP/vmtest/websockify.log" || true
+              exit 1
+            fi
             TARGET_PORT=6080
             echo "XFCE desktop started. The noVNC browser client will request the VNC password."
             echo "Desktop VNC password is the first 8 characters of VM_WEB_PASSWORD."
@@ -362,7 +420,20 @@ jobs:
             TUNNEL_PID=$!
             for wait_attempt in $(seq 1 25); do
               if [[ "$SESSION_MODE" == "desktop" ]]; then
-                kill -0 "$VNC_PID" 2>/dev/null || { echo "::error::XFCE/VNC stopped unexpectedly."; cat "$RUNNER_TEMP/vmtest/x11vnc.log"; exit 1; }
+                if ! kill -0 "$VNC_PID" 2>/dev/null; then
+                echo "::error::XFCE/VNC stopped unexpectedly. x11vnc log:"
+                cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
+                echo "XFCE log:"
+                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+                echo "noVNC log:"
+                cat "$RUNNER_TEMP/vmtest/websockify.log" || true
+                exit 1
+              fi
+              if ! kill -0 "$XFCE_PID" 2>/dev/null; then
+                echo "::error::XFCE desktop process stopped unexpectedly. Diagnostic log:"
+                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+                exit 1
+              fi
               else
                 kill -0 "$TTYD_PID" 2>/dev/null || { echo "::error::The browser terminal stopped unexpectedly."; cat "$RUNNER_TEMP/vmtest/ttyd.log"; exit 1; }
               fi
