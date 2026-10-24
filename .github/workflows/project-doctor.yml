@@ -1,0 +1,129 @@
+name: IMMERSIVE CCTV - Project Doctor
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**.java'
+      - '**.gradle'
+      - '**.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - 'settings.gradle'
+      - 'settings.gradle.kts'
+      - '.github/workflows/project-doctor.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  project-doctor:
+    name: Inspect, compile and report
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Inspect repository and compile mod
+        id: build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $reportDir = Join-Path $env:RUNNER_TEMP 'immersive-cctv-doctor'
+          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+          $logPath = Join-Path $reportDir 'build.log'
+          $sourceFiles = @(Get-ChildItem -Path . -Recurse -File -Filter '*.java' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\/](build|\.gradle|\.git)[\\/]' })
+          $resources = @(Get-ChildItem -Path 'src\main\resources' -Recurse -File -ErrorAction SilentlyContinue)
+          $recipes = @($resources | Where-Object { $_.FullName -match '[\\/]recipes[\\/].+\.json$' })
+          $models = @($resources | Where-Object { $_.FullName -match '[\\/]models[\\/].+\.json$' })
+          $textures = @($resources | Where-Object { $_.Extension -match '^\.(png|jpg|jpeg)$' })
+          $todoMatches = @()
+          if ($sourceFiles.Count -gt 0) { $todoMatches = @(Select-String -Path $sourceFiles.FullName -Pattern 'TODO|FIXME|XXX' -ErrorAction SilentlyContinue) }
+          $wrapper = Test-Path '.\gradlew.bat'
+          $buildScript = (Test-Path '.\build.gradle') -or (Test-Path '.\build.gradle.kts')
+          $settingsScript = (Test-Path '.\settings.gradle') -or (Test-Path '.\settings.gradle.kts')
+          $buildExit = 1
+          if ($wrapper -and $buildScript -and $settingsScript) {
+            & .\gradlew.bat build --no-daemon --stacktrace 2>&1 | Tee-Object -FilePath $logPath
+            $buildExit = $LASTEXITCODE
+          } else {
+            @("Gradle build not started: required files missing.", "gradlew.bat: $wrapper", "build script: $buildScript", "settings script: $settingsScript") | Set-Content -LiteralPath $logPath -Encoding UTF8
+          }
+          "build_exit=$buildExit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "source_count=$($sourceFiles.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "recipe_count=$($recipes.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "model_count=$($models.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "texture_count=$($textures.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "todo_count=$($todoMatches.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($buildExit -ne 0) { exit 1 }
+
+      - name: Generate useful reports even after a failed build
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $reportDir = Join-Path $env:RUNNER_TEMP 'immersive-cctv-doctor'
+          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+          $files = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.java' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\/](build|\.gradle|\.git)[\\/]' })
+          $resources = @(Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'src\main\resources') -Recurse -File -ErrorAction SilentlyContinue)
+          $recipes = @($resources | Where-Object { $_.FullName -match '[\\/]recipes[\\/].+\.json$' })
+          $models = @($resources | Where-Object { $_.FullName -match '[\\/]models[\\/].+\.json$' })
+          $textures = @($resources | Where-Object { $_.Extension -match '^\.(png|jpg|jpeg)$' })
+          $todos = @()
+          if ($files.Count -gt 0) { $todos = @(Select-String -Path $files.FullName -Pattern 'TODO|FIXME|XXX' -ErrorAction SilentlyContinue) }
+          $logPath = Join-Path $reportDir 'build.log'
+          if (-not (Test-Path $logPath)) { 'Build log missing; inspect earlier workflow steps.' | Set-Content -LiteralPath $logPath -Encoding UTF8 }
+          $log = Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue
+          $errors = @($log -split "\r?\n" | Where-Object { $_ -match '(?i)error:|BUILD FAILED|Could not resolve|Could not find|Compilation failed|What went wrong' } | Select-Object -First 80)
+          $buildStatus = if ('${ steps.build.outputs.build_exit }' -eq '0') { 'BUILD PASSED' } else { 'BUILD FAILED OR NOT STARTED' }
+          $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'
+          $summary = @"
+          # IMMERSIVE CCTV - Project Doctor
+          Generated: $generated
+
+          ## Result
+          $buildStatus
+
+          ## Repository inventory
+          - Java source files: $($files.Count)
+          - Recipe JSON files: $($recipes.Count)
+          - Model JSON files: $($models.Count)
+          - Image textures: $($textures.Count)
+          - TODO / FIXME / XXX markers: $($todos.Count)
+
+          ## Build diagnostics
+          $($errors -join "\n")
+
+          Full Gradle output is in build.log. File counts do not guarantee that assets are valid.
+          "@
+          Set-Content -LiteralPath (Join-Path $reportDir 'project-doctor-report.md') -Value $summary -Encoding UTF8
+          $htmlErrors = [System.Net.WebUtility]::HtmlEncode(($errors -join "`n"))
+          $color = if ($buildStatus -eq 'BUILD PASSED') { '#79f2d0' } else { '#ff9c8f' }
+          $html = @"
+          <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IMMERSIVE CCTV Project Doctor</title><style>body{margin:0;background:#0b1018;color:#eef4ff;font:16px/1.5 system-ui,sans-serif}main{max-width:950px;margin:auto;padding:24px 16px}.card{background:#151e2c;border:1px solid #33445d;border-radius:16px;padding:22px;margin-bottom:14px}.hero{background:linear-gradient(130deg,#183b43,#1b2037)}h1{font-size:clamp(32px,6vw,56px);line-height:1.05}.status{font-size:24px;font-weight:800;color:$color}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}.metric{font-size:32px;font-weight:800;color:#79f2d0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#080c12;padding:14px;border-radius:10px}</style></head><body><main>
+          <section class="card hero"><h1>IMMERSIVE CCTV<br>Project Doctor</h1><div class="status">$buildStatus</div><p>Automated repository inventory and real Gradle build attempt</p><p>Generated: $generated</p></section>
+          <section class="grid"><div class="card">Java files<div class="metric">$($files.Count)</div></div><div class="card">Recipes<div class="metric">$($recipes.Count)</div></div><div class="card">Models<div class="metric">$($models.Count)</div></div><div class="card">Textures<div class="metric">$($textures.Count)</div></div><div class="card">TODO markers<div class="metric">$($todos.Count)</div></div></section>
+          <section class="card"><h2>Detected build errors</h2><pre>$htmlErrors</pre><p>Full output is in build.log. Inventory counts show what exists, not whether each asset is correct.</p></section></main></body></html>
+          "@
+          Set-Content -LiteralPath (Join-Path $reportDir 'project-doctor-report.html') -Value $html -Encoding UTF8
+          Write-Host "Reports saved to $reportDir"
+
+      - name: Upload report and full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immersive-cctv-project-doctor
+          path: ${ runner.temp }/immersive-cctv-doctor/
+          if-no-files-found: error
+          retention-days: 30
