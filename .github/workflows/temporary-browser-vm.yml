@@ -40,7 +40,7 @@ jobs:
     # Requires a GitHub Actions runner installed and started inside Ubuntu on WSL2.
     # The Windows run.cmd runner must not pick up this Linux-only job.
     runs-on: [self-hosted, linux, x64, iusnex_ubuntu]
-    timeout-minutes: 1
+    timeout-minutes: 30
     steps:
       - name: Check out VM UI assets
         uses: actions/checkout@v4
