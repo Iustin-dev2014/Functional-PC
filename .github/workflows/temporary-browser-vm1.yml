@@ -285,7 +285,11 @@ jobs:
             source /etc/bash.bashrc.d/immersive-vm
           fi
           BASHRC
+            # Force every graphical component onto the private Xvfb display.
+            # Do not let WSLg/Wayland redirect XFCE to the laptop's local desktop.
             export DISPLAY=:99
+            unset WAYLAND_DISPLAY WAYLAND_SOCKET
+            export XDG_SESSION_TYPE=x11
             Xvfb :99 -screen 0 1280x800x24 -ac > "$RUNNER_TEMP/vmtest/xvfb.log" 2>&1 &
             DISPLAY_PID=$!
             sleep 2
@@ -294,11 +298,22 @@ jobs:
               cat "$RUNNER_TEMP/vmtest/xvfb.log" || true
               exit 1
             fi
-            dbus-run-session -- startxfce4 > "$RUNNER_TEMP/vmtest/xfce.log" 2>&1 &
+            if ! DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              echo "::error::Private Xvfb display :99 is not responding."
+              cat "$RUNNER_TEMP/vmtest/xvfb.log" || true
+              exit 1
+            fi
+            DISPLAY=:99 xsetroot -solid '#263238' || true
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:99 XDG_SESSION_TYPE=x11 dbus-run-session -- startxfce4 > "$RUNNER_TEMP/vmtest/xfce.log" 2>&1 &
             XFCE_PID=$!
             sleep 5
             if ! kill -0 "$XFCE_PID" 2>/dev/null; then
               echo "::error::XFCE exited during startup. Diagnostic log:"
+              cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+              exit 1
+            fi
+            if ! DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+              echo "::error::XFCE startup lost access to the private Xvfb display :99."
               cat "$RUNNER_TEMP/vmtest/xfce.log" || true
               exit 1
             fi
