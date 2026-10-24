@@ -1,0 +1,27 @@
+name: Stop Temporary Browser VM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  stop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Cancel temporary browser VM runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Finding active Temporary Browser VM runs..."
+          gh run list --repo "${GITHUB_REPOSITORY}" --workflow "temporary-browser-vm.yml" --status in_progress --json databaseId --jq '.[].databaseId' |
+          while IFS= read -r run_id; do
+            [ -n "${run_id}" ] || continue
+            echo "Cancelling VM run #${run_id}"
+            gh run cancel "${run_id}" --repo "${GITHUB_REPOSITORY}" || echo "::warning::Run #${run_id} may already have stopped."
+          done
+          echo "Finished requesting cancellation of active browser VM runs."
