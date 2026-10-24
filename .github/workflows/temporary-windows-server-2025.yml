@@ -1,0 +1,238 @@
+name: Temporary Windows Server 2025 Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Session duration (1–360 minutes)"
+        required: true
+        default: "120"
+        type: string
+      snapshot_source:
+        description: "Restore user files from a previous Windows session"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none
+          - latest
+          - specific
+      snapshot_run_id:
+        description: "Run ID to restore when snapshot_source is specific"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: temporary-windows-server-2025
+  cancel-in-progress: true
+
+jobs:
+  windows-desktop:
+    name: Windows Server 2025 browser desktop
+    runs-on: windows-2025
+    timeout-minutes: 370
+    steps:
+      - name: Check out desktop gateway
+        uses: actions/checkout@v4
+
+      - name: Validate settings and password
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          SNAPSHOT_SOURCE: ${{ inputs.snapshot_source }}
+          SNAPSHOT_RUN_ID: ${{ inputs.snapshot_run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:VM_WEB_PASSWORD) -or $env:VM_WEB_PASSWORD.Length -lt 16) {
+            throw "Add repository secret VM_WEB_PASSWORD with at least 16 characters."
+          }
+          $minutes = 0
+          if (!( [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes)) -or $minutes -lt 1 -or $minutes -gt 360) {
+            throw "session_minutes must be a number from 1 to 360."
+          }
+          if ($env:SNAPSHOT_SOURCE -eq "specific" -and $env:SNAPSHOT_RUN_ID -notmatch '^\d+$') {
+            throw "Enter a numeric snapshot_run_id when snapshot_source is specific."
+          }
+          "SESSION_MINUTES=$minutes" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore a previous Windows user-files snapshot (optional)
+        if: inputs.snapshot_source != 'none'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_SOURCE: ${{ inputs.snapshot_source }}
+          SNAPSHOT_RUN_ID: ${{ inputs.snapshot_run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "X-GitHub-Api-Version" = "2022-11-28"; Accept = "application/vnd.github+json" }
+          if ($env:SNAPSHOT_SOURCE -eq "specific") {
+            $runId = $env:SNAPSHOT_RUN_ID
+          } else {
+            $uri = "https://api.github.com/repos/$env:REPOSITORY/actions/runs?status=completed&per_page=100"
+            $runs = (Invoke-RestMethod -Headers $headers -Uri $uri).workflow_runs
+            $runId = $null
+            foreach ($run in $runs) {
+              $arts = (Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:REPOSITORY/actions/runs/$($run.id)/artifacts").artifacts
+              if ($arts | Where-Object { $_.name -eq "windows-session-save-$($run.id)" -and !$_.expired }) { $runId = [string]$run.id; break }
+            }
+            if (!$runId) { throw "No prior Windows snapshot artifact was found." }
+          }
+          $artifactList = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:REPOSITORY/actions/runs/$runId/artifacts"
+          $artifact = $artifactList.artifacts | Where-Object { $_.name -eq "windows-session-save-$runId" -and !$_.expired } | Select-Object -First 1
+          if (!$artifact) { throw "Snapshot artifact windows-session-save-$runId was not found or has expired." }
+          $zip = Join-Path $env:RUNNER_TEMP "windows-session-save.zip"
+          Invoke-WebRequest -Headers $headers -Uri $artifact.archive_download_url -OutFile $zip
+          $restore = Join-Path $env:RUNNER_TEMP "windows-session-restore"
+          Expand-Archive -Path $zip -DestinationPath $restore -Force
+          $manifest = Join-Path $restore "snapshot-manifest.json"
+          if (!(Test-Path $manifest)) { throw "Snapshot manifest is missing; refusing to restore an unknown archive." }
+          $data = Get-Content $manifest -Raw | ConvertFrom-Json
+          if ($data.format -ne "ICCTV-WINDOWS-USERFILES-1") { throw "Unsupported snapshot format." }
+          $profile = $env:USERPROFILE
+          foreach ($folder in @("Desktop","Documents","Downloads")) {
+            $source = Join-Path $restore $folder
+            if (Test-Path $source) {
+              $target = Join-Path $profile $folder
+              New-Item -ItemType Directory -Path $target -Force | Out-Null
+              & robocopy $source $target /E /COPY:DAT /DCOPY:DAT /R:1 /W:1
+              $robocopyCode = $LASTEXITCODE
+              if ($robocopyCode -gt 7) { throw "Restoring $folder failed with robocopy exit code $robocopyCode." }
+            }
+          }
+          Write-Host "Restored user files from Windows run $runId. This does not restore Windows itself or installed applications."
+
+      - name: Install VNC and browser gateway
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install tightvnc -y --no-progress
+          python -m pip install --disable-pip-version-check websockify pycryptodome
+          $novncZip = Join-Path $env:RUNNER_TEMP "noVNC.zip"
+          $novncDir = Join-Path $env:RUNNER_TEMP "noVNC"
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" -OutFile $novncZip
+          Expand-Archive -Path $novncZip -DestinationPath $novncDir -Force
+          $novncRoot = Get-ChildItem $novncDir -Directory | Select-Object -First 1
+          if (!(Test-Path (Join-Path $novncRoot.FullName "vnc.html"))) { throw "Could not find noVNC vnc.html." }
+          npm install --prefix (Join-Path $env:RUNNER_TEMP "windows-desktop-proxy") --no-save http-proxy@1.18.1
+          "NOVNC_ROOT=$($novncRoot.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $vnc = "C:\Program Files\TightVNC\tvnserver.exe"
+          if (!(Test-Path $vnc)) { $vnc = "C:\Program Files (x86)\TightVNC\tvnserver.exe" }
+          if (!(Test-Path $vnc)) { throw "TightVNC server executable not found." }
+          "TVNSERVER=$vnc" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start authenticated browser desktop and temporary tunnel
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $logDir = Join-Path $env:RUNNER_TEMP "windows-server-2025-desktop"
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+          $pythonScript = @'
+          from Crypto.Cipher import DES
+          import sys
+          def reverse_bits(v): return int(f"{v:08b}"[::-1], 2)
+          key = bytes(reverse_bits(x) for x in b"\x17\x52\x6b\x06\x23\x4e\x58\x07")
+          password = sys.argv[1].encode("utf-8")[:8].ljust(8, b"\0")
+          print(",".join(str(x) for x in DES.new(key, DES.MODE_ECB).encrypt(password)))
+          '@
+          $encrypted = python -c $pythonScript "local-vnc-only"
+          $passwordBytes = [byte[]]($encrypted -split "," | ForEach-Object { [byte]$_ })
+          $regPath = "HKCU:\Software\TightVNC\Server"
+          New-Item -Path $regPath -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "AcceptRfbConnections" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "UseVncAuthentication" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "Password" -PropertyType Binary -Value $passwordBytes -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "LoopbackOnly" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "RfbPort" -PropertyType DWord -Value 5900 -Force | Out-Null
+          Start-Process -FilePath $env:TVNSERVER -ArgumentList "-run" -RedirectStandardOutput (Join-Path $logDir "vnc-out.log") -RedirectStandardError (Join-Path $logDir "vnc-err.log")
+          Start-Sleep -Seconds 5
+          $websockify = Start-Process -FilePath python -ArgumentList @("-m","websockify","--allow-loopback","--web=$env:NOVNC_ROOT","127.0.0.1:6080","127.0.0.1:5900") -PassThru -RedirectStandardOutput (Join-Path $logDir "websockify.log") -RedirectStandardError (Join-Path $logDir "websockify-err.log")
+          $env:NODE_PATH = Join-Path $env:RUNNER_TEMP "windows-desktop-proxy\node_modules"
+          $env:VM_UI_PORT = "8090"
+          $proxy = Start-Process -FilePath node -ArgumentList @("$env:GITHUB_WORKSPACE/.github/scripts/minecraft-desktop-proxy.cjs") -PassThru -RedirectStandardOutput (Join-Path $logDir "proxy.log") -RedirectStandardError (Join-Path $logDir "proxy-err.log")
+          $ready = $false
+          for ($i=0; $i -lt 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8090/vnc.html" -UseBasicParsing -TimeoutSec 3
+              if ($r.StatusCode -eq 200 -and $r.Content -match "noVNC") { $ready = $true; break }
+            } catch {
+              if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401) { $ready = $true; break }
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (!$ready) { Get-Content (Join-Path $logDir "proxy-err.log") -ErrorAction SilentlyContinue; throw "Browser gateway smoke test failed." }
+          $cloudflared = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
+          if ((Get-Item $cloudflared).Length -lt 1000000) { throw "cloudflared download looks invalid." }
+          $out = Join-Path $logDir "tunnel-out.log"; $err = Join-Path $logDir "tunnel-err.log"
+          $tunnel = Start-Process $cloudflared -ArgumentList @("tunnel","--url","http://127.0.0.1:8090","--no-autoupdate") -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $url = $null
+          for ($i=0; $i -lt 90; $i++) {
+            Start-Sleep -Seconds 1
+            foreach ($file in @($out,$err)) {
+              if (Test-Path $file) {
+                $m = Select-String -Path $file -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" | Select-Object -First 1
+                if ($m) { $url = $m.Matches[0].Value; break }
+              }
+            }
+            if ($url -or $tunnel.HasExited) { break }
+          }
+          if (!$url) { Get-Content $err -ErrorAction SilentlyContinue; throw "Could not create Cloudflare Quick Tunnel." }
+          Write-Host "WINDOWS SERVER 2025 BROWSER DESKTOP READY"
+          Write-Host "Open: $url/vnc.html?autoconnect=true&resize=remote&path=websockify"
+          Write-Host "HTTP username: cctvtest"
+          Write-Host "HTTP password: repository secret VM_WEB_PASSWORD"
+          Write-Host "OS: Windows Server 2025 hosted runner (not Windows 11)."
+          Write-Host "Session duration: $env:SESSION_MINUTES minutes."
+          Write-Host "Keep the URL and password private."
+          for ($remaining=0; $remaining -lt ($env:SESSION_MINUTES * 60); $remaining++) {
+            if ($tunnel.HasExited -or $proxy.HasExited -or $websockify.HasExited) { throw "A desktop gateway process exited unexpectedly." }
+            Start-Sleep -Seconds 1
+          }
+          Write-Host "Session limit reached."
+
+      - name: Save Windows user files for the next session
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $snapshot = Join-Path $env:RUNNER_TEMP "windows-session-snapshot"
+          New-Item -ItemType Directory -Path $snapshot -Force | Out-Null
+          $manifest = [ordered]@{
+            format = "ICCTV-WINDOWS-USERFILES-1"
+            created_utc = [DateTime]::UtcNow.ToString("o")
+            runner_image = "windows-2025"
+            note = "User files only; not a full OS, installed-app, registry, or service image."
+          }
+          foreach ($folder in @("Desktop","Documents","Downloads")) {
+            $source = Join-Path $env:USERPROFILE $folder
+            if (Test-Path $source) {
+              $target = Join-Path $snapshot $folder
+              New-Item -ItemType Directory -Path $target -Force | Out-Null
+              & robocopy $source $target /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /XJ
+              $robocopyCode = $LASTEXITCODE
+              if ($robocopyCode -gt 7) { throw "Snapshot of $folder failed with robocopy exit code $robocopyCode." }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $snapshot "snapshot-manifest.json") -Encoding utf8
+          Write-Host "Snapshot files prepared:"
+          Get-ChildItem $snapshot -Recurse -File | Measure-Object -Property Length -Sum | ForEach-Object { Write-Host ("Files: {0}; bytes: {1}" -f $_.Count,$_.Sum) }
+
+      - name: Upload Windows snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-session-save-${{ github.run_id }}
+          path: ${{ runner.temp }}/windows-session-snapshot/
+          if-no-files-found: warn
+          compression-level: 1
+          retention-days: 30
