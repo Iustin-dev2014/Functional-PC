@@ -1,0 +1,141 @@
+name: Temporary Windows Desktop (Windows Latest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Initial desktop session length (minutes)"
+        type: choice
+        required: true
+        default: "10"
+        options:
+          - "2"
+          - "10"
+          - "30"
+          - "60"
+      save_snapshot:
+        description: "Upload a workspace snapshot artifact when the session ends"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: temporary-windows-desktop
+  cancel-in-progress: true
+
+jobs:
+  windows-desktop:
+    name: Temporary Windows GUI session
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate web password
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VM_WEB_PASSWORD)) {
+            throw "Missing repository secret VM_WEB_PASSWORD. Add it under Settings > Secrets and variables > Actions."
+          }
+          if ($env:VM_WEB_PASSWORD.Length -lt 8) {
+            throw "VM_WEB_PASSWORD must contain at least 8 characters."
+          }
+
+      - name: Prepare Windows desktop access tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\win-desktop" | Out-Null
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install websockify
+          $cloudflared = "$env:RUNNER_TEMP\win-desktop\cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
+          & $cloudflared --version
+          # Windows GitHub-hosted runners already provide an interactive desktop session.
+          # We expose it through a temporary, password-protected RDP gateway rather than installing an untrusted VNC binary.
+          $rdp = Get-Service TermService -ErrorAction SilentlyContinue
+          if (-not $rdp) { throw "Remote Desktop Services (TermService) is unavailable on this Windows runner." }
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+          New-NetFirewallRule -DisplayName "Temporary GitHub Actions RDP" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          # Configure a temporary local account used only for this ephemeral runner.
+          $password = ConvertTo-SecureString $env:VM_WEB_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name "cctvdesktop" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "cctvdesktop" -Password $password
+          } else {
+            New-LocalUser -Name "cctvdesktop" -Password $password -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "cctvdesktop" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0
+          Write-Host "Temporary Windows desktop services prepared."
+
+      - name: Start temporary tunnel and session timer
+        id: session
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          SAVE_SNAPSHOT: ${{ inputs.save_snapshot }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "$env:RUNNER_TEMP\win-desktop"
+          $cloudflared = "$root\cloudflared.exe"
+          $log = "$root\cloudflared.log"
+          $tunnel = Start-Process -FilePath $cloudflared -ArgumentList @("tunnel","--url","tcp://127.0.0.1:3389","--no-autoupdate") -PassThru -RedirectStandardOutput $log -RedirectStandardError "$root\cloudflared-error.log"
+          $url = $null
+          for ($i=0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $log) {
+              $match = Select-String -Path $log -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | Select-Object -First 1
+              if ($match) { $url = $match.Matches[0].Value; break }
+            }
+            if ($tunnel.HasExited) { break }
+          }
+          if (-not $url) {
+            Get-Content $log -ErrorAction SilentlyContinue
+            Get-Content "$root\cloudflared-error.log" -ErrorAction SilentlyContinue
+            throw "Cloudflare tunnel did not provide a URL. A Quick Tunnel does not reliably proxy raw RDP/TCP; use this workflow only if your environment supports the selected tunnel protocol."
+          }
+          Write-Host "TEMPORARY WINDOWS DESKTOP SESSION"
+          Write-Host "Tunnel URL: $url"
+          Write-Host "Username: .\cctvdesktop"
+          Write-Host "Password: VM_WEB_PASSWORD secret"
+          Write-Host "Important: standard Cloudflare Quick Tunnels are HTTP-oriented and may not support RDP clients directly."
+          $minutes = [int]$env:SESSION_MINUTES
+          $deadline = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            if (-not (Get-Process -Id $tunnel.Id -ErrorAction SilentlyContinue)) { break }
+          }
+          Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue
+          if ($env:SAVE_SNAPSHOT -eq 'true') {
+            $snapshot = "$root\workspace-snapshot.zip"
+            Compress-Archive -Path "$env:GITHUB_WORKSPACE\*" -DestinationPath $snapshot -Force
+            "snapshot_path=$snapshot" >> $env:GITHUB_OUTPUT
+          }
+          Write-Host "Temporary Windows session ended."
+
+      - name: Upload workspace snapshot
+        if: always() && inputs.save_snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-workspace-snapshot-${{ github.run_id }}
+          path: ${{ runner.temp }}\win-desktop\workspace-snapshot.zip
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup temporary desktop account and firewall rule
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-LocalUser -Name "cctvdesktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "Temporary GitHub Actions RDP" -ErrorAction SilentlyContinue
