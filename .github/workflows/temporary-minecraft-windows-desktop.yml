@@ -1,0 +1,168 @@
+name: Temporary Minecraft Windows Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-minecraft-windows-desktop
+  cancel-in-progress: true
+
+jobs:
+  windows-desktop:
+    name: Windows Server desktop with Minecraft Launcher
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Check out desktop proxy
+        uses: actions/checkout@v4
+
+      - name: Validate required password secret
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VM_WEB_PASSWORD)) {
+            Write-Error "Missing repository secret VM_WEB_PASSWORD. Add it in Settings > Secrets and variables > Actions."
+          }
+          if ($env:VM_WEB_PASSWORD.Length -lt 16) {
+            Write-Error "VM_WEB_PASSWORD must be at least 16 characters long."
+          }
+
+      - name: Install VNC server, browser gateway, and Minecraft Launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install tightvnc -y --no-progress
+          python -m pip install --disable-pip-version-check websockify pycryptodome
+
+          $launcher = Join-Path $env:RUNNER_TEMP "MinecraftInstaller.exe"
+          Invoke-WebRequest -Uri "https://launcher.mojang.com/download/MinecraftInstaller.exe" -OutFile $launcher
+          if (!(Test-Path $launcher) -or (Get-Item $launcher).Length -lt 1000000) {
+            throw "The official Minecraft Launcher installer download looks invalid."
+          }
+
+          $novncZip = Join-Path $env:RUNNER_TEMP "noVNC.zip"
+          $novncDir = Join-Path $env:RUNNER_TEMP "noVNC"
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" -OutFile $novncZip
+          Expand-Archive -Path $novncZip -DestinationPath $novncDir -Force
+          $novncRoot = Get-ChildItem $novncDir -Directory | Select-Object -First 1
+          if (!(Test-Path (Join-Path $novncRoot.FullName "vnc.html"))) {
+            throw "Could not locate vnc.html in the downloaded noVNC files."
+          }
+
+          npm install --prefix (Join-Path $env:RUNNER_TEMP "minecraft-desktop-proxy") --no-save http-proxy@1.18.1
+          "NOVNC_ROOT=$($novncRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $tightVnc = "C:\Program Files\TightVNC\tvnserver.exe"
+          if (!(Test-Path $tightVnc)) {
+            $tightVnc = "C:\Program Files (x86)\TightVNC\tvnserver.exe"
+          }
+          if (!(Test-Path $tightVnc)) { throw "TightVNC server executable was not found after installation." }
+          "TVNSERVER=$tightVnc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure loopback-only VNC and start the browser gateway
+        shell: pwsh
+        env:
+          VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $logDir = Join-Path $env:RUNNER_TEMP "minecraft-windows-desktop"
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+
+          # Create a VNC password file/registry value using the standard VNC DES scheme.
+          # VNC is restricted to loopback; the externally reachable browser gateway has its own secret gate.
+          $vncPassword = "local-vnc-only"
+          $pythonScript = @'
+          from Crypto.Cipher import DES
+          import sys
+          def reverse_bits(v):
+              return int(f"{v:08b}"[::-1], 2)
+          key = bytes(reverse_bits(x) for x in b"\x17\x52\x6b\x06\x23\x4e\x58\x07")
+          password = sys.argv[1].encode("utf-8")[:8].ljust(8, b"\0")
+          print(",".join(str(x) for x in DES.new(key, DES.MODE_ECB).encrypt(password)))
+          '@
+          $encrypted = python -c $pythonScript $vncPassword
+          $passwordBytes = [byte[]]($encrypted -split "," | ForEach-Object { [byte]$_ })
+          $regPath = "HKCU:\Software\TightVNC\Server"
+          New-Item -Path $regPath -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "AcceptRfbConnections" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "UseVncAuthentication" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "Password" -PropertyType Binary -Value $passwordBytes -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "LoopbackOnly" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $regPath -Name "RfbPort" -PropertyType DWord -Value 5900 -Force | Out-Null
+
+          # Use application mode in the runner's logged-in desktop session.
+          Start-Process -FilePath $env:TVNSERVER -ArgumentList "-run" -RedirectStandardOutput (Join-Path $logDir "vnc-out.log") -RedirectStandardError (Join-Path $logDir "vnc-err.log")
+          Start-Sleep -Seconds 5
+
+          $websockify = Start-Process -FilePath "python" -ArgumentList @("-m","websockify","--allow-loopback","--web=$env:NOVNC_ROOT","127.0.0.1:6080","127.0.0.1:5900") -PassThru -RedirectStandardOutput (Join-Path $logDir "websockify.log") -RedirectStandardError (Join-Path $logDir "websockify-err.log")
+          $env:NODE_PATH = Join-Path $env:RUNNER_TEMP "minecraft-desktop-proxy\node_modules"
+          $env:VM_UI_PORT = "8090"
+          $proxy = Start-Process -FilePath "node" -ArgumentList @("$env:GITHUB_WORKSPACE/.github/scripts/minecraft-desktop-proxy.cjs") -PassThru -RedirectStandardOutput (Join-Path $logDir "proxy.log") -RedirectStandardError (Join-Path $logDir "proxy-err.log")
+
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/vnc.html" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+              if ($response.StatusCode -eq 200 -and $response.Content -match "noVNC") { $ready = $true; break }
+            } catch {
+              if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401) { $ready = $true; break }
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (!$ready) {
+            Get-Content (Join-Path $logDir "proxy.log") -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $logDir "websockify-err.log") -ErrorAction SilentlyContinue
+            throw "The authenticated browser gateway did not pass its local smoke test."
+          }
+
+          # The official launcher installer is opened in the desktop; sign in with your own Microsoft account.
+          Start-Process -FilePath (Join-Path $env:RUNNER_TEMP "MinecraftInstaller.exe")
+          $cloudflared = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
+          if (!(Test-Path $cloudflared) -or (Get-Item $cloudflared).Length -lt 1000000) {
+            throw "The cloudflared download looks invalid."
+          }
+
+          $tunnelOut = Join-Path $logDir "cloudflared-out.log"
+          $tunnelErr = Join-Path $logDir "cloudflared-err.log"
+          $tunnel = Start-Process -FilePath $cloudflared -ArgumentList @("tunnel","--url","http://127.0.0.1:8090","--no-autoupdate") -PassThru -RedirectStandardOutput $tunnelOut -RedirectStandardError $tunnelErr
+          $url = $null
+          for ($i = 0; $i -lt 90; $i++) {
+            Start-Sleep -Seconds 1
+            foreach ($log in @($tunnelOut, $tunnelErr)) {
+              if (Test-Path $log) {
+                $match = Select-String -Path $log -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" | Select-Object -First 1
+                if ($match) { $url = $match.Matches[0].Value; break }
+              }
+            }
+            if ($url) { break }
+            if ($tunnel.HasExited) { break }
+          }
+          if (!$url) {
+            Get-Content $tunnelOut -ErrorAction SilentlyContinue
+            Get-Content $tunnelErr -ErrorAction SilentlyContinue
+            throw "Could not create the temporary browser desktop tunnel."
+          }
+
+          Write-Host "=================================================="
+          Write-Host "TEMPORARY WINDOWS MINECRAFT DESKTOP READY"
+          Write-Host "Open: $url/vnc.html?autoconnect=true&resize=remote&path=websockify"
+          Write-Host "HTTP username: cctvtest"
+          Write-Host "HTTP password: the repository secret VM_WEB_PASSWORD"
+          Write-Host "Runner OS: Windows Server 2022 (not Windows 11)"
+          Write-Host "Minecraft Launcher installer has been opened; sign in with your own Microsoft account."
+          Write-Host "This is a temporary, best-effort desktop and will stop after 45 minutes."
+          Write-Host "Do not share the URL or password."
+          Write-Host "=================================================="
+
+          for ($remaining = 0; $remaining -lt 2700; $remaining++) {
+            if ($tunnel.HasExited -or $proxy.HasExited -or $websockify.HasExited) {
+              throw "A desktop gateway process exited unexpectedly."
+            }
+            Start-Sleep -Seconds 1
+          }
+          Write-Host "45-minute session limit reached; closing the temporary desktop."
