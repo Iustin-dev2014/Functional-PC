@@ -3,6 +3,15 @@ name: Temporary Browser VM (terminal or XFCE desktop)
 on:
   workflow_dispatch:
     inputs:
+      runner_target:
+        description: "Where should Ubuntu run?"
+        type: choice
+        required: true
+        default: github
+        options:
+          - github
+          - self-hosted
+
       session_mode:
         description: "Choose the Ubuntu session to open in your browser"
         type: choice
@@ -11,8 +20,9 @@ on:
         options:
           - terminal
           - desktop
+
       snapshot_source:
-        description: "Ubuntu snapshot: latest = newest saved artifact; none = start from scratch; specific = choose a run ID below"
+        description: "Ubuntu snapshot: latest = newest saved artifact; none = start from scratch; specific = choose a run ID"
         type: choice
         required: true
         default: latest
@@ -20,14 +30,15 @@ on:
           - latest
           - none
           - specific
+
       snapshot_run_id:
-        description: "Only for 'specific': enter the run ID shown in the available Ubuntu snapshot list in the Actions logs"
+        description: "Only for specific: enter a run ID from the snapshot list"
         type: string
         required: false
         default: ""
 
 permissions:
-  actions: read
+  actions: write
   contents: write
 
 concurrency:
@@ -37,39 +48,57 @@ concurrency:
 jobs:
   browser-vm:
     name: Start temporary Ubuntu browser session
-    # Requires a GitHub Actions runner installed and started inside Ubuntu on WSL2.
-    # The Windows run.cmd runner must not pick up this Linux-only job.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    runs-on: ${{ inputs.runner_target == 'self-hosted' && 'wsl-ubuntu' || 'ubuntu-latest' }}
+
+    timeout-minutes: 360
+
     steps:
       - name: Check out VM UI assets
         uses: actions/checkout@v4
 
-      - name: Verify WSL2 Ubuntu runner
+      - name: Verify selected Ubuntu runner
         shell: bash
+        env:
+          RUNNER_TARGET: ${{ inputs.runner_target }}
         run: |
           set -euo pipefail
+
           if [[ "$(uname -s)" != "Linux" ]]; then
-            echo "::error::This workflow must run on the Ubuntu WSL2 runner, not a Windows runner. Configure the runner inside WSL2 and add the label wsl-ubuntu."
+            echo "::error::This workflow requires a Linux Ubuntu runner."
             exit 1
           fi
+
           if [[ ! -r /etc/os-release ]] || ! grep -qi '^ID=ubuntu' /etc/os-release; then
-            echo "::error::The selected Linux runner is not Ubuntu. Configure the GitHub Actions runner inside Ubuntu WSL2."
+            echo "::error::The selected runner is not Ubuntu."
             exit 1
           fi
-          echo "Runner OS verified: $(. /etc/os-release && echo "$PRETTY_NAME")"
+
+          echo "Runner target: ${RUNNER_TARGET}"
+          echo "Runner OS: $(. /etc/os-release && echo "$PRETTY_NAME")"
+          echo "Architecture: $(uname -m)"
+
+          if [[ "${RUNNER_TARGET}" == "self-hosted" ]]; then
+            echo "Running on your self-hosted Ubuntu machine."
+          else
+            echo "Running on GitHub-hosted Ubuntu."
+          fi
 
       - name: Check required password secret
         shell: bash
         env:
           VM_WEB_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+          SESSION_MODE: ${{ inputs.session_mode }}
         run: |
+          set -euo pipefail
+
           if [[ -z "${VM_WEB_PASSWORD}" ]]; then
-            echo "::error::Missing repository secret VM_WEB_PASSWORD. Add it in Settings > Secrets and variables > Actions."
+            echo "::error::Missing repository secret VM_WEB_PASSWORD."
             exit 1
           fi
-          if [[ "${{ inputs.session_mode }}" == "desktop" && ${#VM_WEB_PASSWORD} -lt 8 ]]; then
-            echo "::error::For Desktop XFCE, VM_WEB_PASSWORD must contain at least 8 characters (VNC uses the first 8)."
+
+          if [[ "${SESSION_MODE}" == "desktop" && ${#VM_WEB_PASSWORD} -lt 8 ]]; then
+            echo "::error::For Desktop XFCE, VM_WEB_PASSWORD must contain at least 8 characters."
             exit 1
           fi
 
@@ -77,10 +106,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if ! command -v gh >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y gh
           fi
+
           gh --version
 
       - name: List and select Ubuntu snapshot artifact
@@ -94,81 +125,124 @@ jobs:
           SNAPSHOT_RUN_ID: ${{ inputs.snapshot_run_id }}
         run: |
           set -euo pipefail
+
           mkdir -p "ubuntu saves"
+
           echo "Requested snapshot source: ${SNAPSHOT_SOURCE}"
 
           if [[ "${SNAPSHOT_SOURCE}" == "none" ]]; then
             echo "source=none" >> "$GITHUB_OUTPUT"
-            echo "Clean start selected. No previous Ubuntu snapshot will be restored."
+            echo "Clean Ubuntu start selected."
             exit 0
           fi
 
-          # Enumerate completed workflow runs and print every still-available Ubuntu snapshot artifact.
-          mapfile -t RUN_IDS < <(gh run list --workflow temporary-browser-vm1.yml --limit 1000 \
-            --json databaseId,status,conclusion,createdAt \
-            --jq ".[] | select((.databaseId | tostring) != \"${CURRENT_RUN_ID}\" and .status == \"completed\") | .databaseId")
+          mapfile -t RUN_IDS < <(
+            gh run list \
+              --workflow temporary-browser-vm1.yml \
+              --limit 1000 \
+              --json databaseId,status \
+              --jq ".[] | select((.databaseId | tostring) != \"${CURRENT_RUN_ID}\" and .status == \"completed\") | .databaseId"
+          )
+
           declare -a AVAILABLE_RUN_IDS=()
-          echo "Available Ubuntu snapshot artifacts (newest first):"
+
+          echo "Available Ubuntu snapshots (newest first):"
+
           for run_id in "${RUN_IDS[@]}"; do
             artifact_name="ubuntu-session-save-${run_id}"
-            artifact_id="$(gh api "repos/${GH_REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
-              --jq ".artifacts[]? | select(.name == \"${artifact_name}\" and .expired == false) | .id" | head -n 1 || true)"
+
+            artifact_id="$(
+              gh api \
+                "repos/${GH_REPO}/actions/runs/${run_id}/artifacts?per_page=100" \
+                --jq ".artifacts[]? | select(.name == \"${artifact_name}\" and .expired == false) | .id" \
+                | head -n 1 || true
+            )"
+
             if [[ -n "${artifact_id}" ]]; then
               AVAILABLE_RUN_IDS+=("${run_id}")
-              echo "  run_id=${run_id}  artifact=${artifact_name}"
+              echo "run_id=${run_id} artifact=${artifact_name}"
             fi
           done
 
           if [[ "${#AVAILABLE_RUN_IDS[@]}" -eq 0 ]]; then
             if [[ "${SNAPSHOT_SOURCE}" == "specific" ]]; then
-              echo "::error::No available Ubuntu snapshot artifacts were found; cannot select run ID ${SNAPSHOT_RUN_ID}."
+              echo "::error::No available Ubuntu snapshots were found."
               exit 1
             fi
+
             echo "source=none" >> "$GITHUB_OUTPUT"
-            echo "::notice::No previous Ubuntu snapshot artifact exists. Starting from scratch."
+            echo "::notice::No previous snapshot exists. Starting from scratch."
             exit 0
           fi
 
           SELECTED_RUN_ID=""
+
           if [[ "${SNAPSHOT_SOURCE}" == "latest" ]]; then
             SELECTED_RUN_ID="${AVAILABLE_RUN_IDS[0]}"
+
           elif [[ "${SNAPSHOT_SOURCE}" == "specific" ]]; then
+
             if [[ ! "${SNAPSHOT_RUN_ID}" =~ ^[0-9]+$ ]]; then
-              echo "::error::For snapshot_source=specific, enter the numeric run ID of an artifact listed in the log."
+              echo "::error::Enter a valid numeric snapshot run ID."
               exit 1
             fi
+
             for run_id in "${AVAILABLE_RUN_IDS[@]}"; do
               if [[ "${run_id}" == "${SNAPSHOT_RUN_ID}" ]]; then
                 SELECTED_RUN_ID="${run_id}"
                 break
               fi
             done
+
             if [[ -z "${SELECTED_RUN_ID}" ]]; then
-              echo "::error::Run ID ${SNAPSHOT_RUN_ID} does not have an available, unexpired Ubuntu snapshot artifact in this workflow."
+              echo "::error::Selected snapshot does not exist or has expired."
               exit 1
             fi
+
           else
-            echo "::error::Unknown snapshot_source value: ${SNAPSHOT_SOURCE}"
+            echo "::error::Unknown snapshot source."
             exit 1
           fi
 
-          artifact_name="ubuntu-session-save-${SELECTED_RUN_ID}"
-          echo "Selected snapshot: ${artifact_name} (run ${SELECTED_RUN_ID})"
+          ARTIFACT_NAME="ubuntu-session-save-${SELECTED_RUN_ID}"
+
+          ARTIFACT_ID="$(
+            gh api \
+              "repos/${GH_REPO}/actions/runs/${SELECTED_RUN_ID}/artifacts?per_page=100" \
+              --jq ".artifacts[]? | select(.name == \"${ARTIFACT_NAME}\" and .expired == false) | .id" \
+              | head -n 1
+          )"
+
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo "::error::Could not identify selected artifact."
+            exit 1
+          fi
+
+          echo "Selected snapshot: ${ARTIFACT_NAME}"
+          echo "Selected run: ${SELECTED_RUN_ID}"
+
           mkdir -p "ubuntu saves/ubuntu-session-save"
-          if ! gh run download "${SELECTED_RUN_ID}" --name "${artifact_name}" --dir "ubuntu saves/ubuntu-session-save"; then
-            echo "::error::Could not download selected Ubuntu snapshot artifact."
+
+          gh run download "${SELECTED_RUN_ID}" \
+            --name "${ARTIFACT_NAME}" \
+            --dir "ubuntu saves/ubuntu-session-save"
+
+          if [[ ! -f "ubuntu saves/ubuntu-session-save/manifest.db" ]]; then
+            echo "::error::Snapshot manifest is missing."
             exit 1
           fi
-          if [[ ! -f "ubuntu saves/ubuntu-session-save/manifest.db" || ! -d "ubuntu saves/ubuntu-session-save/payload" ]]; then
-            echo "::error::Selected artifact does not contain the expected manifest.db and payload/ structure."
+
+          if [[ ! -d "ubuntu saves/ubuntu-session-save/payload" ]]; then
+            echo "::error::Snapshot payload is missing."
             exit 1
           fi
+
           echo "source=artifact" >> "$GITHUB_OUTPUT"
           echo "snapshot_name=ubuntu-session-save" >> "$GITHUB_OUTPUT"
           echo "snapshot_run_id=${SELECTED_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "Downloaded selected snapshot. Integrity validation will happen during restore."
+          echo "artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
 
-      - name: Validate and restore saved Ubuntu session (if selected)
+      - name: Validate and restore saved Ubuntu session
         id: restore
         if: inputs.snapshot_source != 'none' && steps.find_snapshot.outputs.source == 'artifact'
         shell: bash
@@ -184,23 +258,65 @@ jobs:
           SESSION_MODE: ${{ inputs.session_mode }}
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           if [[ "${SESSION_MODE}" == "desktop" ]]; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb xfce4 xfce4-terminal dbus-x11 x11vnc novnc websockify xterm x11-utils
+
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              xvfb \
+              xfce4 \
+              xfce4-terminal \
+              dbus-x11 \
+              x11vnc \
+              novnc \
+              websockify \
+              xterm \
+              x11-utils
+
           else
-            # The self-hosted Ubuntu runner does not guarantee Node.js/npm are preinstalled.
-            sudo apt-get install -y ttyd nodejs npm
+
+            sudo apt-get install -y \
+              ttyd \
+              nodejs \
+              npm
+
             node --version
             npm --version
-            npm install --prefix "$RUNNER_TEMP/vmtest/proxy" --no-save http-proxy@1.18.1
+
+            mkdir -p "$RUNNER_TEMP/vmtest/proxy"
+
+            npm install \
+              --prefix "$RUNNER_TEMP/vmtest/proxy" \
+              --no-save \
+              http-proxy@1.18.1
+
           fi
+
           mkdir -p "$RUNNER_TEMP/vmtest"
+
+          ARCH="$(uname -m)"
+
+          case "${ARCH}" in
+            x86_64)
+              CLOUDFLARED_ARCH="amd64"
+              ;;
+            aarch64|arm64)
+              CLOUDFLARED_ARCH="arm64"
+              ;;
+            *)
+              echo "::error::Unsupported architecture: ${ARCH}"
+              exit 1
+              ;;
+          esac
+
           curl --fail --silent --show-error --location \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" \
             -o "$RUNNER_TEMP/vmtest/cloudflared"
+
           chmod 700 "$RUNNER_TEMP/vmtest/cloudflared"
+
           "$RUNNER_TEMP/vmtest/cloudflared" --version
-          echo "Selected session mode: ${SESSION_MODE}"
 
       - name: Start protected Ubuntu session and temporary public tunnel
         id: session
@@ -210,170 +326,259 @@ jobs:
           SESSION_MODE: ${{ inputs.session_mode }}
         run: |
           set -euo pipefail
+
           CLOUDFLARED="$RUNNER_TEMP/vmtest/cloudflared"
+
           export VM_SHUTDOWN_MARKER="$RUNNER_TEMP/vmtest/shutdown-requested"
           export VM_NO_SAVE_MARKER="$RUNNER_TEMP/vmtest/no-save-requested"
+
           EXTEND_FIFO="$RUNNER_TEMP/vmtest/extend.fifo"
+
           mkfifo "$EXTEND_FIFO"
+
           export VM_EXTEND_FIFO="$EXTEND_FIFO"
+
           exec 9<> "$EXTEND_FIFO"
 
           cat > "$RUNNER_TEMP/vmtest/session-shell.rc" <<'SHELL_RC'
-          export PS1='[user]@immersive-cctv! '
+          export PS1='[user]@ubuntu:~$ '
+
           extend() {
-            if [[ "${1:-}" == "" || ! "${1:-}" =~ ^[0-9]+$ ]]; then
+            if [[ -z "${1:-}" || ! "${1:-}" =~ ^[0-9]+$ ]]; then
               echo "Usage: extend <minutes> (1-300)"
               return 2
             fi
+
             if (( ${#1} > 3 )) || (( 10#${1} < 1 || 10#${1} > 300 )); then
               echo "Minutes must be between 1 and 300."
               return 2
             fi
+
             printf '%s\n' "${1}" > "$VM_EXTEND_FIFO"
-            echo "Extension request sent to workflow: +${1} minute(s)."
+            echo "Extension request sent: +${1} minute(s)."
           }
+
           shutdown() {
-            printf '\n[WARNING] Ubuntu is shutting down. GitHub Actions will close this temporary session normally.\n'
+            printf '\nUbuntu session is shutting down.\n'
             touch "$VM_SHUTDOWN_MARKER"
             exit 0
           }
+
           nosave() {
             if [[ "$#" -eq 1 && "${1:-}" == "-yes" ]]; then
               touch "$VM_NO_SAVE_MARKER"
-              printf '\n[NO-SAVE MODE] Enabled. The session stays open. When it eventually closes, no new snapshot ZIP will be created or uploaded. Type save -yes to cancel this and save normally.\n'
+              echo "NO-SAVE enabled."
               return 0
             fi
-            echo "Usage: nosave -yes  (keep this session open, but do not save a snapshot when it closes)"
+
+            echo "Usage: nosave -yes"
             return 2
           }
+
           save() {
             if [[ "$#" -eq 1 && "${1:-}" == "-yes" ]]; then
               rm -f "$VM_NO_SAVE_MARKER"
-              printf '\n[SAVE MODE] Enabled. When this session closes normally, a snapshot ZIP will be created and uploaded.\n'
+              echo "SAVE enabled."
               return 0
             fi
-            echo "Usage: save -yes  (cancel no-save mode and save a snapshot when the session closes)"
+
+            echo "Usage: save -yes"
             return 2
           }
+
           poweroff() { shutdown "$@"; }
           halt() { shutdown "$@"; }
+
           reboot() {
-            printf '\n[WARNING] Reboot requested; closing this temporary Ubuntu session instead.\n'
+            echo "Reboot requested. Closing temporary session."
             touch "$VM_SHUTDOWN_MARKER"
             exit 0
           }
+
           sudo() {
             local arg
             for arg in "$@"; do
               case "${arg##*/}" in
-                shutdown|poweroff|halt|reboot) shutdown "$@"; return $? ;;
+                shutdown|poweroff|halt|reboot)
+                  shutdown "$@"
+                  return $?
+                  ;;
               esac
             done
             command sudo "$@"
           }
-          echo "Temporary session: 2 minutes. Type: extend <minutes> (1-300)"
+
+          echo "Temporary Ubuntu session: 2 minutes."
+          echo "Use extend <minutes> to extend."
           SHELL_RC
 
-          if [[ "$SESSION_MODE" == "desktop" ]]; then
-            echo "Starting XFCE desktop in a virtual X display..."
-            sudo install -m 0644 "$RUNNER_TEMP/vmtest/session-shell.rc" /etc/immersive-vm-shell.rc
-            sudo tee /etc/bash.bashrc.d-immersive-vm >/dev/null < "$RUNNER_TEMP/vmtest/session-shell.rc"
+          if [[ "${SESSION_MODE}" == "desktop" ]]; then
+
+            echo "Starting XFCE desktop..."
+
+            sudo install -m 0644 \
+              "$RUNNER_TEMP/vmtest/session-shell.rc" \
+              /etc/immersive-vm-shell.rc
+
             sudo mkdir -p /etc/bash.bashrc.d
-            sudo mv /etc/bash.bashrc.d-immersive-vm /etc/bash.bashrc.d/immersive-vm
-            sudo tee -a /etc/bash.bashrc >/dev/null <<'BASHRC'
+
+            sudo install -m 0644 \
+              "$RUNNER_TEMP/vmtest/session-shell.rc" \
+              /etc/bash.bashrc.d/immersive-vm
+
+            if ! grep -q 'immersive-vm' /etc/bash.bashrc; then
+              sudo tee -a /etc/bash.bashrc >/dev/null <<'BASHRC'
+
           if [[ -r /etc/bash.bashrc.d/immersive-vm ]]; then
             source /etc/bash.bashrc.d/immersive-vm
           fi
           BASHRC
-            # Force every graphical component onto the private Xvfb display.
-            # Do not let WSLg/Wayland redirect XFCE to the laptop's local desktop.
+            fi
+
             export DISPLAY=:99
             unset WAYLAND_DISPLAY WAYLAND_SOCKET
             export XDG_SESSION_TYPE=x11
-            Xvfb :99 -screen 0 1280x800x24 -ac > "$RUNNER_TEMP/vmtest/xvfb.log" 2>&1 &
+
+            Xvfb :99 -screen 0 1280x800x24 -ac \
+              > "$RUNNER_TEMP/vmtest/xvfb.log" 2>&1 &
+
             DISPLAY_PID=$!
+
             sleep 2
+
             if ! kill -0 "$DISPLAY_PID" 2>/dev/null; then
-              echo "::error::Xvfb failed to start. Diagnostic log:"
+              echo "::error::Xvfb failed."
               cat "$RUNNER_TEMP/vmtest/xvfb.log" || true
               exit 1
             fi
+
             if ! DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
-              echo "::error::Private Xvfb display :99 is not responding."
-              cat "$RUNNER_TEMP/vmtest/xvfb.log" || true
+              echo "::error::Xvfb display is unavailable."
               exit 1
             fi
-            DISPLAY=:99 xsetroot -solid '#263238' || true
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:99 XDG_SESSION_TYPE=x11 dbus-run-session -- startxfce4 > "$RUNNER_TEMP/vmtest/xfce.log" 2>&1 &
+
+            DISPLAY=:99 xsetroot -solid '#090d16' || true
+
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              DISPLAY=:99 XDG_SESSION_TYPE=x11 \
+              dbus-run-session -- startxfce4 \
+              > "$RUNNER_TEMP/vmtest/xfce.log" 2>&1 &
+
             XFCE_PID=$!
+
             sleep 5
+
             if ! kill -0 "$XFCE_PID" 2>/dev/null; then
-              echo "::error::XFCE exited during startup. Diagnostic log:"
+              echo "::error::XFCE failed to start."
               cat "$RUNNER_TEMP/vmtest/xfce.log" || true
               exit 1
             fi
-            if ! DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
-              echo "::error::XFCE startup lost access to the private Xvfb display :99."
-              cat "$RUNNER_TEMP/vmtest/xfce.log" || true
-              exit 1
-            fi
-            DISPLAY=:99 xfce4-terminal --disable-server --command "bash --rcfile /etc/immersive-vm-shell.rc -i" > "$RUNNER_TEMP/vmtest/xfce-terminal.log" 2>&1 &
+
+            DISPLAY=:99 xfce4-terminal \
+              --disable-server \
+              --command "bash --rcfile /etc/immersive-vm-shell.rc -i" \
+              > "$RUNNER_TEMP/vmtest/xfce-terminal.log" 2>&1 &
+
             XTERM_PID=$!
-            x11vnc -storepasswd "${VM_WEB_PASSWORD:0:8}" "$RUNNER_TEMP/vmtest/x11vnc.pass" >/dev/null
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:99 XDG_SESSION_TYPE=x11 x11vnc -display :99 -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" -forever -shared -rfbport 5900 -localhost -noxdamage > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
+
+            x11vnc -storepasswd \
+              "${VM_WEB_PASSWORD:0:8}" \
+              "$RUNNER_TEMP/vmtest/x11vnc.pass" >/dev/null
+
+            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              DISPLAY=:99 XDG_SESSION_TYPE=x11 \
+              x11vnc \
+              -display :99 \
+              -rfbauth "$RUNNER_TEMP/vmtest/x11vnc.pass" \
+              -forever \
+              -shared \
+              -rfbport 5900 \
+              -localhost \
+              -noxdamage \
+              > "$RUNNER_TEMP/vmtest/x11vnc.log" 2>&1 &
+
             VNC_PID=$!
+
             VNC_READY=0
-            for vnc_attempt in $(seq 1 20); do
+
+            for attempt in $(seq 1 20); do
               if ! kill -0 "$VNC_PID" 2>/dev/null; then
-                echo "::error::x11vnc exited before opening port 5900. Diagnostic log:"
+                echo "::error::VNC stopped during startup."
                 cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
-                echo "XFCE diagnostic log:"
-                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
                 exit 1
               fi
+
               if (echo > /dev/tcp/127.0.0.1/5900) >/dev/null 2>&1; then
                 VNC_READY=1
                 break
               fi
+
               sleep 1
             done
+
             if [[ "$VNC_READY" -ne 1 ]]; then
-              echo "::error::x11vnc remained running but port 5900 never became ready. Diagnostic log:"
-              cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
+              echo "::error::VNC did not become ready."
               exit 1
             fi
+
             NOVNC_WEB="$RUNNER_TEMP/vmtest/novnc-web"
+
             mkdir -p "$NOVNC_WEB"
+
             cp -a /usr/share/novnc/. "$NOVNC_WEB/"
+
             cat > "$NOVNC_WEB/index.html" <<'NOVNC_INDEX'
           <!doctype html>
-          <html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=/vnc.html?autoconnect=true&resize=remote"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ubuntu Desktop</title></head>
-          <body style="font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;display:grid;place-items:center;min-height:90vh"><main><h2>Opening Ubuntu Desktop…</h2><p>If the desktop does not open automatically, <a style="color:#93c5fd" href="/vnc.html?autoconnect=true&resize=remote">tap here to connect</a>.</p></main><script>location.replace('/vnc.html?autoconnect=true&resize=remote');</script></body></html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta http-equiv="refresh" content="0;url=/vnc.html?autoconnect=true&resize=remote">
+          <title>Ubuntu Desktop</title>
+          </head>
+          <body>
+          <p>Opening Ubuntu Desktop...</p>
+          <a href="/vnc.html?autoconnect=true&resize=remote">Connect</a>
+          </body>
+          </html>
           NOVNC_INDEX
-            websockify --web="$NOVNC_WEB" 6080 localhost:5900 > "$RUNNER_TEMP/vmtest/websockify.log" 2>&1 &
+
+            websockify \
+              --web="$NOVNC_WEB" \
+              6080 localhost:5900 \
+              > "$RUNNER_TEMP/vmtest/websockify.log" 2>&1 &
+
             WEB_PID=$!
+
             WEB_READY=0
-            for web_attempt in $(seq 1 15); do
+
+            for attempt in $(seq 1 15); do
               if ! kill -0 "$WEB_PID" 2>/dev/null; then
-                echo "::error::noVNC/websockify exited during startup. Diagnostic log:"
+                echo "::error::noVNC stopped during startup."
                 cat "$RUNNER_TEMP/vmtest/websockify.log" || true
                 exit 1
               fi
+
               if curl --fail --silent http://127.0.0.1:6080/ -o /dev/null; then
                 WEB_READY=1
                 break
               fi
+
               sleep 1
             done
+
             if [[ "$WEB_READY" -ne 1 ]]; then
-              echo "::error::noVNC web interface did not become ready on port 6080. Diagnostic log:"
-              cat "$RUNNER_TEMP/vmtest/websockify.log" || true
+              echo "::error::noVNC interface did not become ready."
               exit 1
             fi
+
             TARGET_PORT=6080
-            echo "XFCE desktop started. The noVNC browser client will request the VNC password."
-            echo "Desktop VNC password is the first 8 characters of VM_WEB_PASSWORD."
+
+            echo "XFCE desktop ready."
+            echo "VNC password: first 8 characters of VM_WEB_PASSWORD."
+
           else
+
             TTYD_PORT="$(python3 - <<'PY'
           import socket
           s = socket.socket()
@@ -382,6 +587,7 @@ jobs:
           s.close()
           PY
           )"
+
             VM_UI_PORT="$(python3 - <<'PY'
           import socket
           s = socket.socket()
@@ -390,178 +596,288 @@ jobs:
           s.close()
           PY
           )"
+
             export NODE_PATH="$RUNNER_TEMP/vmtest/proxy/node_modules"
-            ttyd --interface 127.0.0.1 --port "$TTYD_PORT" --client-option fontSize=16 \
-              --credential "cctvtest:${VM_WEB_PASSWORD}" --writable \
-              bash --noprofile --rcfile "$RUNNER_TEMP/vmtest/session-shell.rc" -i \
+
+            ttyd \
+              --interface 127.0.0.1 \
+              --port "$TTYD_PORT" \
+              --client-option fontSize=16 \
+              --credential "cctvtest:${VM_WEB_PASSWORD}" \
+              --writable \
+              bash --noprofile \
+              --rcfile "$RUNNER_TEMP/vmtest/session-shell.rc" -i \
               > "$RUNNER_TEMP/vmtest/ttyd.log" 2>&1 &
+
             TTYD_PID=$!
-            TTYD_PORT="$TTYD_PORT" VM_UI_PORT="$VM_UI_PORT" node "$GITHUB_WORKSPACE/.github/scripts/vm-ui-proxy.cjs" \
+
+            TTYD_PORT="$TTYD_PORT" \
+            VM_UI_PORT="$VM_UI_PORT" \
+            node "$GITHUB_WORKSPACE/.github/scripts/vm-ui-proxy.cjs" \
               > "$RUNNER_TEMP/vmtest/vm-ui-proxy.log" 2>&1 &
+
             UI_PROXY_PID=$!
+
             TARGET_PORT="$VM_UI_PORT"
+
             UI_READY=0
-            for ui_attempt in $(seq 1 20); do
-              if curl --fail --silent --user "cctvtest:${VM_WEB_PASSWORD}" "http://127.0.0.1:${VM_UI_PORT}/" -o "$RUNNER_TEMP/vmtest/ui-check.html" 2>/dev/null \
+
+            for attempt in $(seq 1 20); do
+              if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+                echo "::error::ttyd stopped unexpectedly."
+                cat "$RUNNER_TEMP/vmtest/ttyd.log" || true
+                exit 1
+              fi
+
+              if curl --fail --silent \
+                --user "cctvtest:${VM_WEB_PASSWORD}" \
+                "http://127.0.0.1:${VM_UI_PORT}/" \
+                -o "$RUNNER_TEMP/vmtest/ui-check.html" 2>/dev/null \
                 && grep -q "VM CONSOLE" "$RUNNER_TEMP/vmtest/ui-check.html" \
                 && grep -q "data-chord" "$RUNNER_TEMP/vmtest/ui-check.html"; then
+
                 UI_READY=1
                 break
               fi
+
               sleep 1
             done
+
             if [[ "$UI_READY" -ne 1 ]]; then
-              echo "::error::Modern terminal UI failed its local smoke test."
+              echo "::error::Terminal UI smoke test failed."
               cat "$RUNNER_TEMP/vmtest/vm-ui-proxy.log" || true
               cat "$RUNNER_TEMP/vmtest/ttyd.log" || true
               exit 1
             fi
-            echo "Modern terminal UI smoke test passed."
+
+            echo "Terminal UI smoke test passed."
+
           fi
 
+          TUNNEL_PID=""
+
           cleanup() {
-            for pid in "${TUNNEL_PID:-}" "${WEB_PID:-}" "${VNC_PID:-}" "${XTERM_PID:-}" "${XFCE_PID:-}" "${DISPLAY_PID:-}" "${UI_PROXY_PID:-}" "${TTYD_PID:-}"; do
-              if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+            for pid in \
+              "${TUNNEL_PID:-}" \
+              "${WEB_PID:-}" \
+              "${VNC_PID:-}" \
+              "${XTERM_PID:-}" \
+              "${XFCE_PID:-}" \
+              "${DISPLAY_PID:-}" \
+              "${UI_PROXY_PID:-}" \
+              "${TTYD_PID:-}"; do
+
+              if [[ -n "$pid" ]]; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+              fi
             done
           }
-          TUNNEL_PID=""
+
           trap cleanup EXIT
 
           URL=""
+
           for tunnel_attempt in $(seq 1 5); do
-            echo "Starting Cloudflare Quick Tunnel (attempt ${tunnel_attempt}/5)..."
+
+            echo "Starting Cloudflare Quick Tunnel (${tunnel_attempt}/5)..."
+
             : > "$RUNNER_TEMP/vmtest/cloudflared.log"
-            "$CLOUDFLARED" tunnel --url "http://127.0.0.1:${TARGET_PORT}" --no-autoupdate > "$RUNNER_TEMP/vmtest/cloudflared.log" 2>&1 &
+
+            "$CLOUDFLARED" tunnel \
+              --url "http://127.0.0.1:${TARGET_PORT}" \
+              --no-autoupdate \
+              > "$RUNNER_TEMP/vmtest/cloudflared.log" 2>&1 &
+
             TUNNEL_PID=$!
+
             for wait_attempt in $(seq 1 25); do
-              if [[ "$SESSION_MODE" == "desktop" ]]; then
+
+              if [[ "${SESSION_MODE}" == "desktop" ]]; then
+
                 if ! kill -0 "$VNC_PID" 2>/dev/null; then
-                echo "::error::XFCE/VNC stopped unexpectedly. x11vnc log:"
-                cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
-                echo "XFCE log:"
-                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
-                echo "noVNC log:"
-                cat "$RUNNER_TEMP/vmtest/websockify.log" || true
-                exit 1
-              fi
-              if ! kill -0 "$XFCE_PID" 2>/dev/null; then
-                echo "::error::XFCE desktop process stopped unexpectedly. Diagnostic log:"
-                cat "$RUNNER_TEMP/vmtest/xfce.log" || true
-                exit 1
-              fi
+                  echo "::error::VNC stopped unexpectedly."
+                  cat "$RUNNER_TEMP/vmtest/x11vnc.log" || true
+                  exit 1
+                fi
+
+                if ! kill -0 "$XFCE_PID" 2>/dev/null; then
+                  echo "::error::XFCE stopped unexpectedly."
+                  cat "$RUNNER_TEMP/vmtest/xfce.log" || true
+                  exit 1
+                fi
+
               else
-                kill -0 "$TTYD_PID" 2>/dev/null || { echo "::error::The browser terminal stopped unexpectedly."; cat "$RUNNER_TEMP/vmtest/ttyd.log"; exit 1; }
+
+                if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+                  echo "::error::Terminal stopped unexpectedly."
+                  cat "$RUNNER_TEMP/vmtest/ttyd.log" || true
+                  exit 1
+                fi
+
               fi
-              URL="$(grep -Eo 'https://[^[:space:]]+trycloudflare\.com' "$RUNNER_TEMP/vmtest/cloudflared.log" | head -n 1 || true)"
+
+              URL="$(
+                grep -Eo 'https://[^[:space:]]+trycloudflare\.com' \
+                  "$RUNNER_TEMP/vmtest/cloudflared.log" \
+                  | head -n 1 || true
+              )"
+
               [[ -n "$URL" ]] && break
+
               kill -0 "$TUNNEL_PID" 2>/dev/null || break
+
               sleep 1
             done
+
             [[ -n "$URL" ]] && break
-            echo "Quick Tunnel attempt ${tunnel_attempt} did not produce a URL."
+
+            echo "Tunnel attempt failed."
+
             cat "$RUNNER_TEMP/vmtest/cloudflared.log"
+
             kill "$TUNNEL_PID" 2>/dev/null || true
             wait "$TUNNEL_PID" 2>/dev/null || true
+
             TUNNEL_PID=""
-            if [[ "$tunnel_attempt" -lt 5 ]]; then delay=$((tunnel_attempt * 4)); echo "Retrying in ${delay}s..."; sleep "$delay"; fi
+
+            if [[ "$tunnel_attempt" -lt 5 ]]; then
+              delay=$((tunnel_attempt * 4))
+              sleep "$delay"
+            fi
+
           done
 
           if [[ -z "$URL" ]]; then
-            echo "::error::Could not obtain a temporary tunnel URL after 5 attempts."
-            cat "$RUNNER_TEMP/vmtest/cloudflared.log"
+            echo "::error::Could not obtain Cloudflare tunnel URL."
             exit 1
           fi
 
-          echo "=================================================="
-          if [[ "$SESSION_MODE" == "desktop" ]]; then
-            echo "TEMPORARY UBUNTU XFCE DESKTOP IS READY"
-            echo "Open this URL (it redirects to /vnc.html). Enter the first 8 characters of VM_WEB_PASSWORD in the VNC password prompt."
-            echo "XFCE starts with a terminal open; use extend <minutes> (1-300)."
+          echo "=============================================="
+
+          if [[ "${SESSION_MODE}" == "desktop" ]]; then
+            echo "TEMPORARY UBUNTU XFCE DESKTOP READY"
+            echo "Open: ${URL}"
+            echo "VNC password: first 8 characters of VM_WEB_PASSWORD."
           else
-            echo "TEMPORARY UBUNTU BROWSER TERMINAL IS READY"
+            echo "TEMPORARY UBUNTU TERMINAL READY"
             echo "Username: cctvtest"
-            echo "Password: the value saved as VM_WEB_PASSWORD"
-            echo "Use extend <minutes> (1-300) to add time."
+            echo "Password: VM_WEB_PASSWORD"
+            echo "Open: ${URL}"
           fi
-          echo "$URL"
-          echo "Initial active session time: 2 minutes. Do not share the URL or password."
-          echo "=================================================="
+
+          echo "Initial active session time: 2 minutes."
+          echo "Do not share the URL or password."
+
+          echo "=============================================="
 
           remaining=120
+
           while (( remaining > 0 )); do
+
             if [[ -f "$VM_SHUTDOWN_MARKER" ]]; then
+
               if [[ -f "$VM_NO_SAVE_MARKER" ]]; then
                 echo "no_save=true" >> "$GITHUB_OUTPUT"
-                echo "::notice::No-save mode was enabled. Closing the session without creating or uploading a new snapshot."
-                echo "Ubuntu session closed without saving."
+                echo "::notice::No-save enabled. Snapshot will not be created."
               else
-                echo "::warning::Ubuntu shutdown was requested intentionally; closing the temporary workspace normally."
-                echo "Ubuntu session closed. A snapshot will be created after the session closes."
+                echo "::warning::Intentional shutdown. Snapshot will be created."
               fi
+
               exit 0
             fi
-            if [[ "$SESSION_MODE" == "desktop" ]]; then
-              if ! kill -0 "$VNC_PID" 2>/dev/null; then echo "Desktop server stopped. Ending session normally."; break; fi
+
+            if [[ "${SESSION_MODE}" == "desktop" ]]; then
+              if ! kill -0 "$VNC_PID" 2>/dev/null; then
+                echo "Desktop server stopped."
+                break
+              fi
             else
-              if ! kill -0 "$TTYD_PID" 2>/dev/null; then echo "Browser terminal stopped. Ending session normally."; break; fi
+              if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+                echo "Terminal server stopped."
+                break
+              fi
             fi
 
             if (( remaining == 30 )); then
-              WARNING_MESSAGE="WARNING: only 30 seconds remain in your Ubuntu session. To keep it running, type: extend 10 (or another number of minutes, 1-300)."
+
+              WARNING_MESSAGE="Only 30 seconds remain. Type extend 10 to continue."
+
               echo "::warning::${WARNING_MESSAGE}"
+
               wall "$WARNING_MESSAGE" 2>/dev/null || true
+
               for tty_path in /dev/pts/[0-9]*; do
                 [[ -w "$tty_path" ]] || continue
-                printf '\r\n\033[1;33m[BROADCAST] %s\033[0m\r\n' "$WARNING_MESSAGE" > "$tty_path" 2>/dev/null || true
+                printf '\r\n%s\r\n' "$WARNING_MESSAGE" \
+                  > "$tty_path" 2>/dev/null || true
               done
-              if [[ "$SESSION_MODE" == "desktop" ]] && command -v xmessage >/dev/null 2>&1; then
-                DISPLAY=:99 xmessage -center -timeout 25 -title "Ubuntu session warning" "$WARNING_MESSAGE" >/dev/null 2>&1 &
-              fi
-              printf '\n\033[1;33m%s\033[0m\n\n' "$WARNING_MESSAGE" || true
+
             fi
 
             if IFS= read -r -t 1 -u 9 request; then
-              if [[ "$request" =~ ^[0-9]+$ ]] && (( ${#request} <= 3 )) && (( 10#${request} >= 1 && 10#${request} <= 300 )); then
+
+              if [[ "$request" =~ ^[0-9]+$ ]] \
+                && (( ${#request} <= 3 )) \
+                && (( 10#${request} >= 1 && 10#${request} <= 300 )); then
+
                 remaining=$((remaining + 10#${request} * 60))
-                echo "Timer extended by $request minute(s). Remaining: $((remaining / 60))m $((remaining % 60))s."
+
+                echo "Session extended by ${request} minute(s)."
+                echo "Remaining: $((remaining / 60))m $((remaining % 60))s."
+
               else
-                echo "Ignored invalid extension request."
+                echo "Invalid extension request ignored."
               fi
+
             else
               remaining=$((remaining - 1))
             fi
+
           done
+
           if [[ -f "$VM_NO_SAVE_MARKER" ]]; then
             echo "no_save=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::No-save mode was enabled. Session ended without creating or uploading a new snapshot."
+            echo "::notice::No snapshot will be uploaded."
           fi
-          echo "Session time expired or session stopped. Closing the temporary Ubuntu workspace."
 
-      - name: Remove consumed snapshot only after successful import
+          echo "Temporary Ubuntu session ended."
+
+      - name: Remove locally extracted snapshot
+        if: steps.restore.outputs.restored == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SNAPSHOT_PATH="ubuntu saves/ubuntu-session-save"
+
+          if [[ -d "$SNAPSHOT_PATH" ]]; then
+            rm -rf -- "$SNAPSHOT_PATH"
+            echo "Local extracted snapshot removed."
+          fi
+
+      - name: Delete consumed remote snapshot artifact
         if: steps.restore.outputs.restored == 'true'
         shell: bash
         env:
-          SNAPSHOT_NAME: ${{ steps.restore.outputs.snapshot_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ steps.find_snapshot.outputs.artifact_id }}
         run: |
           set -euo pipefail
-          SNAPSHOT_PATH="ubuntu saves/${SNAPSHOT_NAME}"
-          if [[ ! -e "${SNAPSHOT_PATH}" ]]; then
-            echo "::error::Imported snapshot disappeared before cleanup; refusing to claim it was removed."
+
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo "::error::Missing artifact ID; refusing to report deletion."
             exit 1
           fi
-          # Artifact snapshots are temporary runner files, not repository content.
-          if git ls-files --error-unmatch -- "${SNAPSHOT_PATH}" >/dev/null 2>&1; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git rm -r -- "${SNAPSHOT_PATH}"
-            git commit -m "Consume successfully imported Ubuntu session snapshot"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          else
-            rm -rf -- "${SNAPSHOT_PATH}"
-            echo "Successfully imported artifact snapshot; removed only the local extracted copy. The original artifact remains available until its retention expires."
-          fi
 
-      - name: Create Ubuntu session snapshot chunk directory
+          gh api \
+            --method DELETE \
+            "repos/${GH_REPO}/actions/artifacts/${ARTIFACT_ID}"
+
+          echo "Successfully deleted consumed snapshot artifact."
+
+      - name: Create Ubuntu session snapshot
         id: save_snapshot
         if: always() && steps.session.outcome == 'success' && steps.session.outputs.no_save != 'true'
         shell: bash
@@ -569,6 +885,7 @@ jobs:
           SESSION_MODE: ${{ inputs.session_mode }}
         run: |
           set -euo pipefail
+
           python3 .github/scripts/ubuntu-session-state.py save
 
       - name: Upload Ubuntu session snapshot artifact
